@@ -388,6 +388,7 @@ def train(tokenizer, model, tokenized_datasets):
 
         # Epochs et batch
         num_train_epochs=TRAIN_EPOCHS,
+        max_steps=int(os.getenv("MAX_STEPS", "-1")),  # essai rapide : MAX_STEPS=60 EVAL_STEPS=30
         per_device_train_batch_size=BATCH_SIZE,
         per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION,  # 2
@@ -406,9 +407,9 @@ def train(tokenizer, model, tokenized_datasets):
 
         # Évaluation et sauvegarde
         eval_strategy="steps",
-        eval_steps=250,    # Évalue le modèle tous les 1000 batchs
+        eval_steps=int(os.getenv("EVAL_STEPS", "250")),    # Évalue le modèle tous les 1000 batchs
         save_strategy="steps",
-        save_steps=250,    # Sauvegarde un checkpoint en même temps
+        save_steps=int(os.getenv("EVAL_STEPS", "250")),    # Sauvegarde un checkpoint en même temps
         load_best_model_at_end=True,
         # chrf_macro (défaut) ou chrf_min (protège la langue la plus faible) via BEST_METRIC
         metric_for_best_model=os.getenv("BEST_METRIC", "chrf_macro"),
