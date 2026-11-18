@@ -309,7 +309,7 @@ async def health():
     return {
         "status":  "ok",
         "version": "1.0.0",
-        "models":  ["nllb-200-distilled-600M", "mms-tts"],
+        "models":  [NLLBTranslator.BASE_MODEL_ID.split("/")[-1], "mms-tts"],
         "cache":   "redis" if _get_cache() is not None else "disabled",
     }
 

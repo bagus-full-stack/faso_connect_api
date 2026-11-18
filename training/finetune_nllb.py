@@ -36,10 +36,11 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration (autonome) ──────────────────────────────────────────
 
-BASE_MODEL  = "facebook/nllb-200-distilled-600M"
+BASE_MODEL  = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
 OUTPUT_DIR  = "models/nllb-burkina-v1"
 LOG_DIR     = "logs/tensorboard"
-CORPUS_FILE = "data/processed/corpus_burkina_clean.csv"
+# corpus filtré par score_pairs.py : CORPUS_FILE=data/processed/corpus_burkina_filtered.csv
+CORPUS_FILE = os.getenv("CORPUS_FILE", "data/processed/corpus_burkina_clean.csv")
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
 LANG_CODES = {
@@ -118,10 +119,6 @@ def load_model():
     # Affichera : "trainable params: ~4,000,000 || all params: 619,000,000 || trainable%: 0.6%"
     model.print_trainable_parameters()
 
-    fra_token_id = tokenizer.convert_tokens_to_ids("fra_Latn")
-    model.generation_config.forced_bos_token_id = fra_token_id
-    logger.info(f"forced_bos_token_id fixé sur fra_Latn (id={fra_token_id}) pour l'éval")
-
     logger.info(f"Modèle préparé avec LoRA sur {DEVICE}")
     return tokenizer, model
 
@@ -170,11 +167,18 @@ def load_corpus():
     df = df[df["src"].str.len() > 5]
     df = df[df["tgt"].str.len() > 5]
 
-    # Split propre garanti (pas de df_shuffled hasardeux ici !)
-    df_valid = df[df["source"] == "flores_dev"].copy()
-    df_train = df[df["source"] != "flores_dev"].copy()
-
-    logger.info(f"Entraînement propre : {len(df_train):,} | Validation pure (FLORES) : {len(df_valid):,}")
+    # Validation = FLORES + 500 phrases bambara (absent de FLORES) ; test bambara écarté du train
+    try:
+        from training.data_prep import split_corpus, temperature_sample, both_directions
+    except ImportError:  # lancé par `python training/finetune_nllb.py`
+        from data_prep import split_corpus, temperature_sample, both_directions
+    df_train, df_valid, df_test = split_corpus(df, holdout_lang="bambara")
+    # validation dans les deux sens, 250 phrases max par direction
+    df_valid = both_directions(df_valid, cap=int(os.getenv("VALID_PER_DIRECTION", "250")))
+    logger.info(f"Validation : {len(df_valid):,} lignes\n"
+                + df_valid.groupby(["src_lang", "tgt_lang"]).size().to_string())
+    Path("data/processed").mkdir(parents=True, exist_ok=True)
+    df_test.to_csv("data/processed/test_bambara.csv", index=False, encoding="utf-8")
 
     # 1. SWAPPING (Bidirectionnel)
     logger.info("Inversion des paires (Apprentissage bidirectionnel)...")
@@ -190,20 +194,8 @@ def load_corpus():
     df_noise = df_noise[df_noise["src"] != original_src]
     df_train = pd.concat([df_train, df_noise], ignore_index=True)
 
-    # 3. OVERSAMPLING (Équilibrage à 15000 min)
-    logger.info("Oversampling des langues minoritaires...")
-    MIN_SAMPLES = 6000  # 15000
-    balanced_dfs = []
-    for lang, group in df_train.groupby("tgt_lang"):
-        count = len(group)
-        if count < MIN_SAMPLES:
-            balanced_group = group.sample(n=MIN_SAMPLES, replace=True, random_state=42)
-            balanced_dfs.append(balanced_group)
-        else:
-            balanced_dfs.append(group)
-
-    df_train = pd.concat(balanced_dfs, ignore_index=True)
-    df_train = df_train.sample(frac=1, random_state=42).reset_index(drop=True)
+    # 3. Échantillonnage à température (TEMPERATURE=1 -> proportions brutes)
+    df_train = temperature_sample(df_train, T=float(os.getenv("SAMPLING_TEMPERATURE", "5")))
 
     return df_train, df_valid
 
@@ -283,9 +275,11 @@ def make_compute_metrics(tokenizer):
     import evaluate
     import numpy as np
     bleu = evaluate.load("sacrebleu")
+    chrf = evaluate.load("chrf")
 
     def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
+        predictions, labels = eval_pred.predictions, eval_pred.label_ids
+        inputs = eval_pred.inputs  # requiert include_for_metrics=["inputs"]
 
         # Parfois, les prédictions sont retournées sous forme de tuple, on prend le premier élément
         if isinstance(predictions, tuple):
@@ -304,15 +298,52 @@ def make_compute_metrics(tokenizer):
 
         result = bleu.compute(predictions=decoded_preds, references=decoded_labels)
 
-        return {
+        metrics = {
             "bleu": round(result["score"], 2),
             "bleu_1": round(result["precisions"][0], 2),
             "bleu_2": round(result["precisions"][1], 2),
         }
 
+        # chrF++ par direction : le 1er token de l'entrée = langue source, celui du label = langue cible
+        src_codes = tokenizer.convert_ids_to_tokens(np.asarray(inputs)[:, 0].astype(int).tolist())
+        tgt_codes = tokenizer.convert_ids_to_tokens(np.asarray(labels)[:, 0].astype(int).tolist())
+        groups = {}
+        for i, key in enumerate(zip(src_codes, tgt_codes)):
+            groups.setdefault(key, []).append(i)
+        scores = []
+        for (s, t), idx in sorted(groups.items()):
+            score = chrf.compute(
+                predictions=[decoded_preds[i] for i in idx],
+                references=[decoded_labels[i] for i in idx],
+                word_order=2,
+            )["score"]
+            metrics[f"chrf_{s[:3]}_{t[:3]}"] = round(score, 2)
+            scores.append(score)
+        # chrf_macro = moyenne des directions ; chrf_min = la direction la plus faible (détecte un recul isolé)
+        metrics["chrf_macro"] = round(sum(scores) / len(scores), 2)
+        metrics["chrf_min"] = round(min(scores), 2)
+        return metrics
+
     return compute_metrics
 
 # ── Entraînement ──────────────────────────────────────────────────────
+
+def make_lang_trainer_class():
+    """Trainer dont la génération de validation démarre sur la langue cible de chaque exemple."""
+    from transformers import Seq2SeqTrainer
+
+    class LangPrefixTrainer(Seq2SeqTrainer):
+        def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None, **gen_kwargs):
+            labels = inputs.get("labels")
+            if labels is not None and not prediction_loss_only:
+                # labels[:, 0] = code de langue cible (le tokenizer le place en tête) ; le décodeur
+                # démarre sur </s> puis ce code, ce qui remplace un forced_bos_token_id unique.
+                start = torch.full_like(labels[:, :1], model.config.decoder_start_token_id)
+                gen_kwargs["decoder_input_ids"] = torch.cat([start, labels[:, :1]], dim=1)
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys, **gen_kwargs)
+
+    return LangPrefixTrainer
+
 
 def train(tokenizer, model, tokenized_datasets):
     from transformers import (
@@ -352,8 +383,10 @@ def train(tokenizer, model, tokenized_datasets):
         save_strategy="steps",
         save_steps=250,    # Sauvegarde un checkpoint en même temps
         load_best_model_at_end=True,
-        metric_for_best_model="bleu",
+        # chrf_macro (défaut) ou chrf_min (protège la langue la plus faible) via BEST_METRIC
+        metric_for_best_model=os.getenv("BEST_METRIC", "chrf_macro"),
         greater_is_better=True,
+        include_for_metrics=["inputs"],
 
         # Génération
         predict_with_generate=True,
@@ -372,7 +405,7 @@ def train(tokenizer, model, tokenized_datasets):
     )
 
 
-    trainer = Seq2SeqTrainer(
+    trainer = make_lang_trainer_class()(
         model=model,
         args=training_args,
         train_dataset=tokenized_datasets["train"],

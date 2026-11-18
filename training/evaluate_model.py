@@ -80,7 +80,7 @@ def load_model(model_path: str):
         logger.info("  Détection d'un modèle LoRA -> Chargement du modèle de base + fusion LoRA")
         # On charge le modèle de base NLLB
         base_model = AutoModelForSeq2SeqLM.from_pretrained(
-            "facebook/nllb-200-distilled-600M",
+            BASE_MODEL,
             torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
             use_safetensors=True,
@@ -122,6 +122,20 @@ def load_flores(src_lang: str, tgt_lang: str) -> list[dict]:
             pairs.append({"src": src, "tgt": tgt})
 
     logger.info(f"✅ FLORES-200 devtest {src_lang}→{tgt_lang} : {len(pairs)} phrases")
+    return pairs
+
+HOLDOUT_FILE = "data/processed/test_bambara.csv"  # écrit par finetune_nllb.py (bambara->francais)
+
+
+def load_holdout(src_lang: str, tgt_lang: str) -> list[dict]:
+    """Test bambara tenu à l'écart du train, dans les deux sens (le fichier est bambara->francais)."""
+    if {src_lang, tgt_lang} != {"bambara", "francais"} or not Path(HOLDOUT_FILE).exists():
+        return []
+    import pandas as pd
+    df = pd.read_csv(HOLDOUT_FILE, encoding="utf-8")
+    a, b = ("src", "tgt") if src_lang == "bambara" else ("tgt", "src")
+    pairs = [{"src": s, "tgt": t} for s, t in zip(df[a].astype(str), df[b].astype(str))]
+    logger.info(f"✅ Test bambara tenu à l'écart {src_lang}→{tgt_lang} : {len(pairs)} phrases")
     return pairs
 
 # ── Traduction par lot ────────────────────────────────────────────────
@@ -206,6 +220,8 @@ def evaluate_model(
             (lang_name, "francais")
             for lang_name, _, _ in BURKINA_LANGS
         ]
+        if any(l == "bambara" for l, _ in lang_pairs):
+            lang_pairs.append(("francais", "bambara"))
 
     all_results = {}
     model_name = Path(model_path).name
@@ -219,7 +235,7 @@ def evaluate_model(
 
         try:
             # Chargement FLORES-200
-            pairs = load_flores(src_lang, tgt_lang)
+            pairs = load_holdout(src_lang, tgt_lang) or load_flores(src_lang, tgt_lang)
             if not pairs:
                 logger.warning(f"  ⚠️  Pas de données FLORES pour {src_lang}→{tgt_lang}")
                 continue

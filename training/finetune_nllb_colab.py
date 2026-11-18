@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration (autonome) ──────────────────────────────────────────
 
-BASE_MODEL  = "facebook/nllb-200-distilled-600M"
+BASE_MODEL  = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
 OUTPUT_DIR  = "models/nllb-burkina-v1"
 LOG_DIR     = "logs/tensorboard"
 CORPUS_FILE = "data/processed/corpus_burkina_clean.csv"

@@ -12,10 +12,11 @@ if hf_token:
 else:
     print("⚠️  HF_TOKEN manquant — téléchargement non authentifié")
 
-print("Téléchargement NLLB-200 distilled 600M...")
-AutoTokenizer.from_pretrained("facebook/nllb-200-distilled-600M")
+BASE = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
+print(f"Téléchargement {BASE}...")
+AutoTokenizer.from_pretrained(BASE)
 AutoModelForSeq2SeqLM.from_pretrained(
-    "facebook/nllb-200-distilled-600M",
+    BASE,
     low_cpu_mem_usage=True,
 )
 print("✅ Modèles téléchargés.")

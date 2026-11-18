@@ -26,7 +26,8 @@ class NLLBTranslator:
     Chargé une seule fois au démarrage via lifespan FastAPI.
     """
 
-    BASE_MODEL_ID = "facebook/nllb-200-distilled-600M"
+    # Doit être le MÊME modèle que celui utilisé pour entraîner l'adaptateur LoRA
+    BASE_MODEL_ID = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
     ADAPTER_MODEL_ID = os.getenv(
         "NLLB_ADAPTER_PATH",
         str(Path(__file__).resolve().parent.parent / "models" / "nllb-burkina-v1"),

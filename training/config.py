@@ -4,11 +4,12 @@ Configuration centralisée du pipeline de fine-tuning.
 Toutes les constantes sont définies ici.
 Importé par finetune_nllb.py et evaluate_model.py.
 """
+import os
 from pathlib import Path
 
 # ── Modèle ────────────────────────────────────────────────────────────
 
-BASE_MODEL     = "facebook/nllb-200-distilled-600M"
+BASE_MODEL     = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
 OUTPUT_DIR     = "models/nllb-burkina-v1"
 CHECKPOINT_DIR = "models/checkpoints"
 
