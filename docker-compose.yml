@@ -2,8 +2,8 @@ services:
   api:
     build:
       context: .
-      args:
-        - HF_TOKEN=${HF_TOKEN}
+      secrets:
+        - hf_token
     ports:
       - "8000:8000"
     depends_on:
@@ -12,10 +12,13 @@ services:
     env_file:
       - .env
     environment:
-      - TRANSFORMERS_CACHE=/models
+      - HF_HOME=/models
+      - REDIS_URL=redis://redis:6379/0
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - model_cache:/models
+      # adaptateur LoRA fine-tuné : monté, non copié dans l'image
+      - ./models:/app/models:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -40,6 +43,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+
+secrets:
+  hf_token:
+    environment: HF_TOKEN
 
 volumes:
   model_cache:

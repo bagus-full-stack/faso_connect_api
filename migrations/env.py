@@ -10,7 +10,8 @@ from sqlmodel import SQLModel
 from history.models import HistoryEntry  # noqa: F401
 
 config  = context.config
-fileConfig(config.config_file_name)
+if config.attributes.get("configure_logger", True):  # False quand lancé depuis l'API
+    fileConfig(config.config_file_name)
 
 # Remplace l'URL par la variable d'environnement si définie
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./fasoconnect.db")

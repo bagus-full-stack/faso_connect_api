@@ -1,4 +1,4 @@
-# api/main.py — VERSION FINALE COMPLÈTE
+# api/main.py
 import os
 import json
 import hashlib
@@ -6,24 +6,32 @@ import logging
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import redis
-from fastapi import FastAPI, HTTPException, Request, Security, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from huggingface_hub import login
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
+from api.deps import (
+    ALLOWED_ORIGINS, check_config, limiter, verify_api_key,
+)
+from api.metrics import (
+    CACHE_EVENTS, CONTENT_TYPE_LATEST, HTTP_LATENCY, HTTP_REQUESTS,
+    INFER_IN_FLIGHT, INFER_WAITING, generate_latest,
+)
 from translation.nllb_engine import NLLBTranslator, BURKINA_LANG_CODES
 from tts.mms_engine import MMSTTSEngine, MMS_TTS_MODELS
-from history.database import create_db_tables, get_session
+from history.database import create_db_tables
 from history.router import router as history_router
 
 # ── Logging JSON structuré ────────────────────────────────────────────
+
+# Attributs standard d'un LogRecord : tout le reste vient de `extra={...}`.
+_STD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__) | {"message", "asctime"}
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -32,9 +40,8 @@ class JSONFormatter(logging.Formatter):
             "level":     record.levelname,
             "message":   record.getMessage(),
         }
-        if hasattr(record, "extra"):
-            log.update(record.extra)
-        return json.dumps(log, ensure_ascii=False)
+        log.update({k: v for k, v in record.__dict__.items() if k not in _STD_ATTRS})
+        return json.dumps(log, ensure_ascii=False, default=str)
 
 handler = logging.StreamHandler()
 handler.setFormatter(JSONFormatter())
@@ -43,69 +50,77 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────
 
-API_KEY        = os.getenv("API_KEY")
-HF_TOKEN       = os.getenv("HF_TOKEN")
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
-CACHE_TTL      = int(os.getenv("CACHE_TTL", "3600"))
-INFER_TIMEOUT  = int(os.getenv("INFER_TIMEOUT", "60"))
+HF_TOKEN          = os.getenv("HF_TOKEN")
+CACHE_TTL         = int(os.getenv("CACHE_TTL", "3600"))
+CACHE_MAX_BYTES   = int(os.getenv("CACHE_MAX_BYTES", "1500000"))
+INFER_TIMEOUT     = int(os.getenv("INFER_TIMEOUT", "60"))
+INFER_CONCURRENCY = int(os.getenv("INFER_CONCURRENCY", "1"))
+QUEUE_TIMEOUT     = int(os.getenv("QUEUE_TIMEOUT", "15"))
+REDIS_URL         = os.getenv("REDIS_URL", "redis://redis:6379/0")
+TTS_PRELOAD       = os.getenv("TTS_PRELOAD", "all")  # "all", "none" ou "moore,dioula,..."
 
-# ── Auth API Key ──────────────────────────────────────────────────────
+# ── Cache Redis (connexion paresseuse, nouvelle tentative toutes les 30 s) ──
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+_cache = None
+_cache_retry_at = 0.0
 
-async def verify_api_key(key: str = Security(api_key_header)):
-    if not API_KEY:
-        return True
-    if key != API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Clé API invalide ou manquante. Ajoute le header X-API-Key."
+def _get_cache():
+    global _cache, _cache_retry_at
+    if _cache is not None:
+        return _cache
+    if time.time() < _cache_retry_at:
+        return None
+    try:
+        client = redis.Redis.from_url(
+            REDIS_URL, decode_responses=True, socket_connect_timeout=1, socket_timeout=1,
         )
-    return True
+        client.ping()
+        _cache = client
+        logger.info("Redis connecté", extra={"event": "redis_connected"})
+    except Exception:
+        _cache_retry_at = time.time() + 30
+        logger.warning("Redis non disponible — cache désactivé",
+                       extra={"event": "redis_unavailable"})
+    return _cache
 
-# ── Rate Limiting ─────────────────────────────────────────────────────
-
-limiter = Limiter(key_func=get_remote_address)
-
-# ── Cache Redis ───────────────────────────────────────────────────────
-
-CACHE_ENABLED = False
-cache = None
-
-try:
-    cache = redis.Redis(host="redis", port=6379, decode_responses=True)
-    cache.ping()
-    CACHE_ENABLED = True
-    logger.info("Redis connecté", extra={"event": "redis_connected"})
-except Exception:
-    logger.warning("Redis non disponible — cache désactivé",
-                   extra={"event": "redis_unavailable"})
+def _cache_failed():
+    global _cache, _cache_retry_at
+    _cache, _cache_retry_at = None, time.time() + 30
 
 def cache_get(key: str):
-    if not CACHE_ENABLED:
+    client = _get_cache()
+    if client is None:
         return None
     try:
-        value = cache.get(key)
-        return json.loads(value) if value else None
+        value = client.get(key)
     except Exception:
+        _cache_failed()
         return None
+    CACHE_EVENTS.labels("hit" if value else "miss").inc()
+    return json.loads(value) if value else None
 
 def cache_set(key: str, value: dict):
-    if not CACHE_ENABLED:
+    client = _get_cache()
+    if client is None:
+        return
+    payload = json.dumps(value)
+    if len(payload) > CACHE_MAX_BYTES:  # évite de saturer Redis avec de gros audios
         return
     try:
-        cache.setex(key, CACHE_TTL, json.dumps(value))
+        client.setex(key, CACHE_TTL, payload)
     except Exception:
-        pass
+        _cache_failed()
 
 def make_cache_key(prefix: str, *args) -> str:
     raw = ":".join(str(a) for a in args)
-    return f"{prefix}:{hashlib.md5(raw.encode()).hexdigest()}"
+    return f"{prefix}:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 # ── Lifespan ──────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    check_config()
+
     # 1. Auth HuggingFace
     if HF_TOKEN:
         login(token=HF_TOKEN, add_to_git_credential=False)
@@ -113,7 +128,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("HF_TOKEN manquant", extra={"event": "hf_auth_missing"})
 
-    # 2. Base de données
+    # 2. Base de données (migrations Alembic)
     create_db_tables()
     logger.info("Base de données prête", extra={"event": "db_ready"})
 
@@ -131,6 +146,10 @@ async def lifespan(app: FastAPI):
     logger.info("Chargement MMS-TTS...", extra={"event": "model_loading", "model": "mms"})
     t0 = time.time()
     app.state.tts = MMSTTSEngine()
+    if TTS_PRELOAD.lower() != "none":
+        langs = list(MMS_TTS_MODELS) if TTS_PRELOAD.lower() == "all" else \
+            [l.strip() for l in TTS_PRELOAD.split(",") if l.strip()]
+        await asyncio.to_thread(app.state.tts.preload, langs)
     logger.info("MMS-TTS prêt", extra={
         "event": "model_ready", "model": "mms",
         "duration_s": round(time.time() - t0, 1),
@@ -148,7 +167,7 @@ app = FastAPI(
         "Traduction automatique et synthèse vocale pour les langues du Burkina Faso.\n\n"
         "**Langues supportées :** Mooré · Dioula · Fulfulde · Gourmantchéma · Dagaare · Français · Anglais\n\n"
         "**Modèles :** Meta NLLB-200 distilled 600M + Meta MMS-TTS\n\n"
-        "**Auth :** header `X-API-Key` requis si `API_KEY` configurée dans `.env`"
+        "**Auth :** header `X-API-Key` requis. L'historique exige aussi `X-Session-Id` (UUID)."
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -158,9 +177,9 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGIN],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["Content-Type", "X-API-Key"],
+    allow_headers=["Content-Type", "X-API-Key", "X-Session-Id"],
 )
 
 app.state.limiter = limiter
@@ -176,6 +195,11 @@ async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
 async def log_requests(request: Request, call_next):
     t0 = time.time()
     response = await call_next(request)
+    duration = time.time() - t0
+    route = request.scope.get("route")
+    path = route.path if route else "unmatched"  # évite l'explosion de cardinalité
+    HTTP_REQUESTS.labels(request.method, path, response.status_code).inc()
+    HTTP_LATENCY.labels(path).observe(duration)
     logger.info(
         f"{request.method} {request.url.path} → {response.status_code}",
         extra={
@@ -183,7 +207,7 @@ async def log_requests(request: Request, call_next):
             "method":      request.method,
             "path":        request.url.path,
             "status":      response.status_code,
-            "duration_ms": round((time.time() - t0) * 1000),
+            "duration_ms": round(duration * 1000),
             "ip":          request.client.host if request.client else "unknown",
         }
     )
@@ -195,10 +219,13 @@ app.include_router(history_router)
 
 # ── Schémas ───────────────────────────────────────────────────────────
 
+Lang    = Literal[tuple(BURKINA_LANG_CODES)]
+TTSLang = Literal[tuple(MMS_TTS_MODELS)]
+
 class TranslationRequest(BaseModel):
-    text:     str   = Field(..., min_length=1, max_length=2000, example="Bonjour tout le monde")
-    src_lang: str   = Field(..., example="francais")
-    tgt_lang: str   = Field(..., example="moore")
+    text:     str  = Field(..., min_length=1, max_length=2000, examples=["Bonjour tout le monde"])
+    src_lang: Lang = Field(..., examples=["francais"])
+    tgt_lang: Lang = Field(..., examples=["moore"])
 
 class TranslationResponse(BaseModel):
     translated_text: str
@@ -207,9 +234,9 @@ class TranslationResponse(BaseModel):
     cached:          bool = False
 
 class TTSRequest(BaseModel):
-    text:  str   = Field(..., min_length=1, max_length=500, example="Ne y welame")
-    lang:  str   = Field(..., example="moore")
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    text:  str     = Field(..., min_length=1, max_length=500, examples=["Ne y welame"])
+    lang:  TTSLang = Field(..., examples=["moore"])
+    speed: float   = Field(default=1.0, ge=0.5, le=2.0)
 
 class TTSResponse(BaseModel):
     audio_b64:        str
@@ -218,29 +245,56 @@ class TTSResponse(BaseModel):
     lang:             str
 
 class TranslateAndSpeakRequest(BaseModel):
-    text:     str   = Field(..., min_length=1, max_length=2000)
-    src_lang: str
-    tgt_lang: str
-    speed:    float = Field(default=1.0, ge=0.5, le=2.0)
+    text:     str     = Field(..., min_length=1, max_length=2000)
+    src_lang: Lang
+    tgt_lang: TTSLang  # la cible doit avoir une voix : validé avant toute inférence
+    speed:    float   = Field(default=1.0, ge=0.5, le=2.0)
 
-# ── Helper inférence async + timeout ─────────────────────────────────
+# ── Inférence async : file d'attente bornée + timeout ─────────────────
+
+_infer_sem: asyncio.Semaphore | None = None
+
+def _release(sem: asyncio.Semaphore, task: asyncio.Future):
+    INFER_IN_FLIGHT.dec()
+    sem.release()
+    if not task.cancelled():
+        task.exception()  # marque l'exception comme lue
 
 async def run_with_timeout(fn, *args, timeout: int = None):
     """
-    Exécute une inférence synchrone dans un thread séparé
-    sans bloquer l'event loop FastAPI.
-    Lève 504 si le timeout est dépassé.
+    Exécute une inférence synchrone dans un thread, sans bloquer l'event loop.
+
+    - Au plus INFER_CONCURRENCY inférences en même temps ; les autres attendent
+      QUEUE_TIMEOUT s max, puis 503.
+    - Le slot n'est libéré que quand le thread a vraiment fini : un timeout (504)
+      ne laisse donc pas des inférences fantômes s'empiler sur le GPU.
     """
+    global _infer_sem
+    if _infer_sem is None:
+        _infer_sem = asyncio.Semaphore(INFER_CONCURRENCY)
+    sem, limit = _infer_sem, timeout or INFER_TIMEOUT
+
+    INFER_WAITING.inc()
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(fn, *args),
-            timeout=timeout or INFER_TIMEOUT,
+        await asyncio.wait_for(sem.acquire(), QUEUE_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Serveur occupé, réessaie dans quelques secondes.",
+            headers={"Retry-After": "10"},
         )
+    finally:
+        INFER_WAITING.dec()
+
+    INFER_IN_FLIGHT.inc()
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    task.add_done_callback(lambda t: _release(sem, t))
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), limit)
     except asyncio.TimeoutError:
         raise HTTPException(
             status_code=504,
-            detail=f"Inférence trop longue (>{timeout or INFER_TIMEOUT}s). "
-                   "Réessaie avec un texte plus court."
+            detail=f"Inférence trop longue (>{limit}s). Réessaie avec un texte plus court.",
         )
 
 # ── Endpoints système ─────────────────────────────────────────────────
@@ -256,13 +310,24 @@ async def health():
         "status":  "ok",
         "version": "1.0.0",
         "models":  ["nllb-200-distilled-600M", "mms-tts"],
-        "cache":   "redis" if CACHE_ENABLED else "disabled",
+        "cache":   "redis" if _get_cache() is not None else "disabled",
     }
+
+@app.get(
+    "/metrics",
+    tags=["Système"],
+    summary="Métriques Prometheus",
+    dependencies=[Depends(verify_api_key)],
+    include_in_schema=False,
+)
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get(
     "/languages",
     tags=["Système"],
     summary="Langues disponibles",
+    dependencies=[Depends(verify_api_key)],
 )
 async def list_languages():
     """Retourne les langues supportées pour la traduction et la synthèse vocale."""
@@ -294,7 +359,7 @@ async def translate(request: Request, req: TranslationRequest):
     cache_key = make_cache_key("trans", req.text, req.src_lang, req.tgt_lang)
     cached = cache_get(cache_key)
     if cached:
-        return TranslationResponse(**cached, cached=True)
+        return TranslationResponse(**{**cached, "cached": True})
 
     try:
         result = await run_with_timeout(
@@ -333,8 +398,8 @@ async def text_to_speech(request: Request, req: TTSRequest):
     Génère un audio WAV encodé en base64 à partir d'un texte.
 
     - **Rate limit** : 10 requêtes/minute par IP
-    - **Speed** : 0.5 (lent) → 1.0 (normal) → 2.0 (rapide)
-    - **Format** : WAV 16000 Hz, mono, encodé base64
+    - **Speed** : 0.5 (lent) → 1.0 (normal) → 2.0 (rapide), hauteur conservée
+    - **Format** : WAV mono, encodé base64
     """
     cache_key = make_cache_key("tts", req.text, req.lang, req.speed)
     cached = cache_get(cache_key)
@@ -363,7 +428,7 @@ async def text_to_speech(request: Request, req: TTSRequest):
     cache_set(cache_key, data)
     return TTSResponse(**data)
 
-# ── Pipeline ──────────────────────────────────────────────────────────
+# ── Pipeline combiné ──────────────────────────────────────────────────
 
 @app.post(
     "/translate-and-speak",
@@ -392,10 +457,13 @@ async def translate_and_speak(request: Request, req: TranslateAndSpeakRequest):
             request.app.state.translator.translate,
             req.text, req.src_lang, req.tgt_lang,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur traduction : {e}")
+        logger.error(f"Erreur traduction : {e}", extra={"event": "translation_error"})
+        raise HTTPException(status_code=500, detail="Erreur interne lors de la traduction")
 
     # Étape 2 — Synthèse vocale sur le texte traduit
     try:
@@ -403,10 +471,13 @@ async def translate_and_speak(request: Request, req: TranslateAndSpeakRequest):
             request.app.state.tts.synthesize,
             translated, req.tgt_lang, req.speed,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur synthèse vocale : {e}")
+        logger.error(f"Erreur TTS : {e}", extra={"event": "tts_error"})
+        raise HTTPException(status_code=500, detail="Erreur interne lors de la synthèse vocale")
 
     data = {
         "original_text":    req.text,

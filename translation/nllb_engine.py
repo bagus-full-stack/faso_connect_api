@@ -1,6 +1,9 @@
 # translation/nllb_engine.py — VERSION PRODUCTION (LORA FUSIONNÉ)
+import os
+import threading
 import torch
 import logging
+from pathlib import Path
 from typing import Optional
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from peft import PeftModel
@@ -24,9 +27,14 @@ class NLLBTranslator:
     """
 
     BASE_MODEL_ID = "facebook/nllb-200-distilled-600M"
-    ADAPTER_MODEL_ID = "./models/nllb-burkina-v1"
+    ADAPTER_MODEL_ID = os.getenv(
+        "NLLB_ADAPTER_PATH",
+        str(Path(__file__).resolve().parent.parent / "models" / "nllb-burkina-v1"),
+    )
 
     def __init__(self, device: Optional[str] = None):
+        # tokenizer.src_lang est un état partagé : on sérialise les inférences
+        self._lock = threading.Lock()
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         logging.info(f"Chargement de NLLB de base sur {self.device}...")
 
@@ -68,56 +76,58 @@ class NLLBTranslator:
             max_length: int = 512,
             num_beams: int = 5,
     ) -> str:
-        src_code = BURKINA_LANG_CODES.get(src_lang, src_lang)
-        tgt_code = BURKINA_LANG_CODES.get(tgt_lang, tgt_lang)
+        with self._lock:
+            src_code = BURKINA_LANG_CODES.get(src_lang, src_lang)
+            tgt_code = BURKINA_LANG_CODES.get(tgt_lang, tgt_lang)
 
-        self.tokenizer.src_lang = src_code
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
+            self.tokenizer.src_lang = src_code
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            ).to(self.device)
 
-        tgt_lang_id = self._resolve_lang_id(tgt_code)
+            tgt_lang_id = self._resolve_lang_id(tgt_code)
 
-        with torch.no_grad():
-            output_tokens = self.model.generate(
-                **inputs,
-                forced_bos_token_id=tgt_lang_id,
-                max_length=max_length,
-                num_beams=num_beams,
-                early_stopping=True,
-            )
+            with torch.no_grad():
+                output_tokens = self.model.generate(
+                    **inputs,
+                    forced_bos_token_id=tgt_lang_id,
+                    max_length=max_length,
+                    num_beams=num_beams,
+                    early_stopping=True,
+                )
 
-        return self.tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+            return self.tokenizer.decode(output_tokens[0], skip_special_tokens=True)
 
     def translate_batch(self, texts: list[str], src_lang: str, tgt_lang: str) -> list[str]:
         """Traduction par lot — optimise le débit pour plusieurs phrases."""
-        src_code = BURKINA_LANG_CODES.get(src_lang, src_lang)
-        tgt_code = BURKINA_LANG_CODES.get(tgt_lang, tgt_lang)
+        with self._lock:
+            src_code = BURKINA_LANG_CODES.get(src_lang, src_lang)
+            tgt_code = BURKINA_LANG_CODES.get(tgt_lang, tgt_lang)
 
-        self.tokenizer.src_lang = src_code
-        inputs = self.tokenizer(
-            texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=512,
-        ).to(self.device)
-
-        tgt_lang_id = self._resolve_lang_id(tgt_code)
-
-        with torch.no_grad():
-            output_tokens = self.model.generate(
-                **inputs,
-                forced_bos_token_id=tgt_lang_id,
+            self.tokenizer.src_lang = src_code
+            inputs = self.tokenizer(
+                texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
                 max_length=512,
-                num_beams=4,
-            )
+            ).to(self.device)
 
-        return [
-            self.tokenizer.decode(tok, skip_special_tokens=True)
-            for tok in output_tokens
-        ]
+            tgt_lang_id = self._resolve_lang_id(tgt_code)
+
+            with torch.no_grad():
+                output_tokens = self.model.generate(
+                    **inputs,
+                    forced_bos_token_id=tgt_lang_id,
+                    max_length=512,
+                    num_beams=4,
+                )
+
+            return [
+                self.tokenizer.decode(tok, skip_special_tokens=True)
+                for tok in output_tokens
+            ]

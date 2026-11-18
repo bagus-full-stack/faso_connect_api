@@ -2,7 +2,8 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from api.deps import get_user_id, limiter, verify_api_key
 from sqlmodel import Session, select, func, col
 
 from history.database import get_session
@@ -16,7 +17,7 @@ from history.models import (
 from translation.nllb_engine import BURKINA_LANG_CODES
 from tts.mms_engine import MMS_TTS_MODELS
 
-router = APIRouter(prefix="/history", tags=["Historique"])
+router = APIRouter(prefix="/history", tags=["Historique"], dependencies=[Depends(verify_api_key)])
 
 # ── Helpers de validation ─────────────────────────────────────────────
 
@@ -70,9 +71,12 @@ def validate_entry(entry: HistoryEntryCreate) -> None:
     status_code=201,
     summary="Créer une entrée d'historique",
 )
+@limiter.limit("60/minute")
 def create_history_entry(
+    request: Request,
     entry: HistoryEntryCreate,
     session: Session = Depends(get_session),
+    user_id: str = Depends(get_user_id),
 ) -> HistoryEntryRead:
     """
     Crée une entrée d'historique après validation.
@@ -82,7 +86,7 @@ def create_history_entry(
     """
     validate_entry(entry)
 
-    db_entry = HistoryEntry(**entry.model_dump())
+    db_entry = HistoryEntry(**entry.model_dump(), user_id=user_id)
     session.add(db_entry)
     session.commit()
     session.refresh(db_entry)
@@ -96,31 +100,28 @@ def create_history_entry(
     response_model=HistoryListResponse,
     summary="Lister l'historique (paginé)",
 )
+@limiter.limit("60/minute")
 def list_history(
-    user_id:     Optional[str]        = Query(None,  description="Filtrer par user_id"),
+    request:     Request,
     action_type: Optional[ActionType] = Query(None,  description="Filtrer par type d'action"),
     lang:        Optional[str]        = Query(None,  description="Filtrer par src_lang OU tgt_lang"),
     limit:       int                  = Query(20,    ge=1, le=100, description="Nombre de résultats"),
     offset:      int                  = Query(0,     ge=0,         description="Décalage de pagination"),
     session:     Session              = Depends(get_session),
+    user_id:     str                  = Depends(get_user_id),
 ) -> HistoryListResponse:
     """
     Liste paginée de l'historique, triée par created_at desc.
 
     Filtres disponibles :
-    - `user_id`     : filtre sur l'identifiant utilisateur
     - `action_type` : translate | tts | translate_and_speak
     - `lang`        : cherche dans src_lang ET tgt_lang
     - `limit`       : max 100 résultats par page
     - `offset`      : pagination
     """
     # ── Construction de la requête ────────────────────────────────────
-    query       = select(HistoryEntry)
-    count_query = select(func.count()).select_from(HistoryEntry)
-
-    if user_id:
-        query       = query.where(HistoryEntry.user_id == user_id)
-        count_query = count_query.where(HistoryEntry.user_id == user_id)
+    query       = select(HistoryEntry).where(HistoryEntry.user_id == user_id)
+    count_query = select(func.count()).select_from(HistoryEntry).where(HistoryEntry.user_id == user_id)
 
     if action_type:
         query       = query.where(HistoryEntry.action_type == action_type)
@@ -156,9 +157,12 @@ def list_history(
     status_code=204,
     summary="Supprimer une entrée",
 )
+@limiter.limit("60/minute")
 def delete_history_entry(
+    request:  Request,
     entry_id: uuid.UUID,
     session:  Session = Depends(get_session),
+    user_id:  str = Depends(get_user_id),
 ) -> None:
     """
     Supprime une entrée par son UUID.
@@ -166,7 +170,7 @@ def delete_history_entry(
     - 204 si supprimée avec succès
     """
     entry = session.get(HistoryEntry, entry_id)
-    if not entry:
+    if not entry or entry.user_id != user_id:
         raise HTTPException(
             status_code=404,
             detail=f"Entrée introuvable : {entry_id}",
@@ -182,13 +186,15 @@ def delete_history_entry(
     status_code=204,
     summary="Vider tout l'historique de l'utilisateur",
 )
+@limiter.limit("60/minute")
 def clear_history(
-    user_id: str     = Query(..., description="user_id dont on vide l'historique"),
+    request: Request,
     session: Session = Depends(get_session),
+    user_id: str     = Depends(get_user_id),
 ) -> None:
     """
     Supprime toutes les entrées d'un utilisateur.
-    - user_id obligatoire pour éviter de vider tout l'historique global par erreur
+    - ne touche que l'historique de la session courante (X-Session-Id)
     - 204 dans tous les cas (idempotent)
     """
     entries = session.exec(

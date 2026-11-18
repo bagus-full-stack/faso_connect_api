@@ -4,6 +4,10 @@ import numpy as np
 import io
 import base64
 import logging
+import os
+import subprocess
+import tempfile
+import threading
 import scipy.io.wavfile as wavfile
 from dataclasses import dataclass
 from transformers import VitsModel, AutoTokenizer
@@ -27,6 +31,24 @@ class TTSResult:
     duration_seconds: float
 
 
+def _time_stretch(pcm: np.ndarray, sample_rate: int, speed: float) -> np.ndarray:
+    """Change la vitesse sans changer la hauteur (ffmpeg atempo, plage 0.5-2.0)."""
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dst = os.path.join(tmp, "in.wav"), os.path.join(tmp, "out.wav")
+            wavfile.write(src, sample_rate, pcm)
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-i", src, "-filter:a", f"atempo={speed}", dst],
+                check=True, capture_output=True, timeout=30,
+            )
+            return wavfile.read(dst)[1]
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        # shortcut: sans ffmpeg, rééchantillonnage simple (la hauteur change)
+        logging.warning(f"ffmpeg indisponible ({e}) — repli sur resample")
+        import scipy.signal as signal
+        return signal.resample(pcm, int(len(pcm) / speed)).astype(np.int16)
+
+
 class MMSTTSEngine:
     """
     Moteur TTS Meta MMS.
@@ -36,10 +58,15 @@ class MMSTTSEngine:
 
     def __init__(self):
         self._cache: dict = {}
+        self._load_lock = threading.Lock()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         logging.info(f"MMS-TTS initialisé sur {self.device}")
 
     def _load_model(self, lang: str):
+        with self._load_lock:
+            return self._load_model_locked(lang)
+
+    def _load_model_locked(self, lang: str):
         if lang not in self._cache:
             model_id = MMS_TTS_MODELS.get(lang)
             if not model_id:
@@ -66,14 +93,14 @@ class MMSTTSEngine:
         waveform    = output.waveform.squeeze().cpu().numpy()
         sample_rate = model.config.sampling_rate
 
+        pcm = (np.clip(waveform, -1.0, 1.0) * 32767).astype(np.int16)
         if speed != 1.0:
-            import scipy.signal as signal
-            waveform = signal.resample(waveform, int(len(waveform) / speed))
+            pcm = _time_stretch(pcm, sample_rate, speed)
 
-        duration = round(len(waveform) / sample_rate, 2)
+        duration = round(len(pcm) / sample_rate, 2)
 
         buffer = io.BytesIO()
-        wavfile.write(buffer, sample_rate, (waveform * 32767).astype(np.int16))
+        wavfile.write(buffer, sample_rate, pcm)
         audio_b64 = base64.b64encode(buffer.getvalue()).decode()
 
         return TTSResult(

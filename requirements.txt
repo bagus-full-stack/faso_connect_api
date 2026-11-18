@@ -1,30 +1,27 @@
 # ── ML ────────────────────────────────────────
-torch
-transformers>=4.38.0
-peft
-accelerate
-sentencepiece
-sacremoses
-accelerate
-soundfile
-scipy
-huggingface_hub
+torch==2.14.1
+transformers==5.20.2
+peft==0.21.3
+accelerate==1.15.0
+sentencepiece==0.2.3
+sacremoses==0.2.0
+soundfile==0.14.0
+scipy==1.15.3
+numpy==2.2.6
+huggingface_hub==2.4.0
 
 # ── API ───────────────────────────────────────
-fastapi
-uvicorn
-redis
-python-multipart
-pydantic
+fastapi==0.162.5
+uvicorn==0.54.0
+redis==8.1.0
+python-multipart==0.0.32
+pydantic==2.14.3
 
 # ── Base de données (historique) ──────────────
-sqlmodel>=0.0.18
-alembic>=1.13.0
+sqlmodel==0.0.49
+alembic==1.20.1
 
-# ── Sécurité & prod ───────────────────────────
-slowapi
-python-dotenv
-
-# ── Tests ─────────────────────────────────────
-pytest>=8.0.0
-httpx>=0.27.0
+# ── Sécurité, prod & observabilité ────────────
+slowapi==0.1.10
+python-dotenv==1.2.4
+prometheus-client==0.22.1

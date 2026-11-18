@@ -72,7 +72,6 @@ class HistoryEntry(SQLModel, table=True):
 class HistoryEntryRead(SQLModel):
     """Schéma retourné par l'API."""
     id:          uuid.UUID
-    user_id:     Optional[str]
     action_type: ActionType
     src_lang:    Optional[str]
     tgt_lang:    Optional[str]
@@ -84,7 +83,6 @@ class HistoryEntryRead(SQLModel):
 
 class HistoryEntryCreate(SQLModel):
     """Schéma de création — validé avant insertion."""
-    user_id:     Optional[str]    = None
     action_type: ActionType
     src_lang:    Optional[str]    = None
     tgt_lang:    Optional[str]    = None

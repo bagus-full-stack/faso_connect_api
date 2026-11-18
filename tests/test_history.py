@@ -28,12 +28,17 @@ def client_fixture(engine):
             yield session
 
     app.dependency_overrides[get_session] = get_test_session
-    with TestClient(app) as client:
-        yield client
+    # sans `with` : le lifespan (chargement des modèles) n'est pas exécuté
+    client = TestClient(app, headers={"X-API-Key": "test-key", "X-Session-Id": str(uuid.uuid4())})
+    yield client
     app.dependency_overrides.clear()
 
+
+def other_session(client):
+    """Second client (autre session) sur la même base."""
+    return TestClient(client.app, headers={"X-API-Key": "test-key", "X-Session-Id": str(uuid.uuid4())})
+
 TRANSLATE_PAYLOAD = {
-    "user_id":     "user_test_001",
     "action_type": "translate",
     "src_lang":    "francais",
     "tgt_lang":    "moore",
@@ -42,7 +47,6 @@ TRANSLATE_PAYLOAD = {
 }
 
 TTS_PAYLOAD = {
-    "user_id":     "user_test_001",
     "action_type": "tts",
     "src_lang":    "moore",
     "source_text": "Ne y welame",
@@ -50,7 +54,6 @@ TTS_PAYLOAD = {
 }
 
 PIPELINE_PAYLOAD = {
-    "user_id":     "user_test_001",
     "action_type": "translate_and_speak",
     "src_lang":    "francais",
     "tgt_lang":    "moore",
@@ -81,11 +84,10 @@ class TestCreateHistory:
         assert response.status_code == 201
         assert response.json()["action_type"] == "translate_and_speak"
 
-    def test_create_anonymous_entry(self, client):
-        payload = {**TRANSLATE_PAYLOAD, "user_id": None}
-        response = client.post("/history", json=payload)
+    def test_create_ignores_client_user_id(self, client):
+        response = client.post("/history", json={**TRANSLATE_PAYLOAD, "user_id": "pirate"})
         assert response.status_code == 201
-        assert response.json()["user_id"] is None
+        assert "user_id" not in response.json()
 
     def test_create_returns_valid_uuid(self, client):
         response = client.post("/history", json=TRANSLATE_PAYLOAD)
@@ -138,12 +140,13 @@ class TestListHistory:
         data = client.get("/history?offset=2").json()
         assert len(data["items"]) == 1
 
-    def test_list_filter_by_user_id(self, client):
+    def test_list_isolated_per_session(self, client):
         client.post("/history", json=TRANSLATE_PAYLOAD)
-        client.post("/history", json={**TRANSLATE_PAYLOAD, "user_id": "other_user"})
-        data = client.get("/history?user_id=user_test_001").json()
-        assert data["total"] == 1
-        assert data["items"][0]["user_id"] == "user_test_001"
+        other = other_session(client)
+        other.post("/history", json=TRANSLATE_PAYLOAD)
+        other.post("/history", json=TRANSLATE_PAYLOAD)
+        assert client.get("/history").json()["total"] == 1
+        assert other.get("/history").json()["total"] == 2
 
     def test_list_filter_by_action_type(self, client):
         client.post("/history", json=TRANSLATE_PAYLOAD)
@@ -190,22 +193,35 @@ class TestDeleteHistoryEntry:
 class TestClearHistory:
     def test_clear_returns_204(self, client):
         client.post("/history", json=TRANSLATE_PAYLOAD)
-        assert client.delete("/history?user_id=user_test_001").status_code == 204
+        assert client.delete("/history").status_code == 204
 
-    def test_clear_removes_all_user_entries(self, client):
+    def test_clear_removes_all_session_entries(self, client):
         client.post("/history", json=TRANSLATE_PAYLOAD)
         client.post("/history", json=TRANSLATE_PAYLOAD)
-        client.delete("/history?user_id=user_test_001")
-        assert client.get("/history?user_id=user_test_001").json()["total"] == 0
+        client.delete("/history")
+        assert client.get("/history").json()["total"] == 0
 
-    def test_clear_does_not_affect_other_users(self, client):
-        client.post("/history", json=TRANSLATE_PAYLOAD)
-        client.post("/history", json={**TRANSLATE_PAYLOAD, "user_id": "other_user"})
-        client.delete("/history?user_id=user_test_001")
-        assert client.get("/history?user_id=other_user").json()["total"] == 1
+    def test_clear_does_not_touch_other_sessions(self, client):
+        other = other_session(client)
+        other.post("/history", json=TRANSLATE_PAYLOAD)
+        client.delete("/history")
+        assert other.get("/history").json()["total"] == 1
 
     def test_clear_idempotent(self, client):
-        assert client.delete("/history?user_id=user_inexistant").status_code == 204
+        assert client.delete("/history").status_code == 204
 
-    def test_clear_requires_user_id(self, client):
-        assert client.delete("/history").status_code == 422
+
+class TestAccess:
+    def test_wrong_api_key_returns_403(self, client):
+        assert client.get("/history", headers={"X-API-Key": "faux"}).status_code == 403
+
+    def test_missing_session_returns_422(self, client):
+        c = TestClient(client.app, headers={"X-API-Key": "test-key"})
+        assert c.get("/history").status_code == 422
+
+    def test_malformed_session_returns_400(self, client):
+        assert client.get("/history", headers={"X-Session-Id": "pas un uuid!"}).status_code == 400
+
+    def test_cannot_delete_other_session_entry(self, client):
+        entry_id = other_session(client).post("/history", json=TRANSLATE_PAYLOAD).json()["id"]
+        assert client.delete(f"/history/{entry_id}").status_code == 404
