@@ -8,16 +8,7 @@ from typing import Optional
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from peft import PeftModel
 
-BURKINA_LANG_CODES = {
-    "moore": "mos_Latn",
-    "dioula": "dyu_Latn",
-    "bambara": "bam_Latn",
-    "fulfulde": "fuv_Latn",
-    "gourmantsema": "gux_Latn",
-    "dagaare": "dga_Latn",
-    "francais": "fra_Latn",
-    "anglais": "eng_Latn",
-}
+from translation.lang_codes import BURKINA_LANG_CODES  # noqa: F401 (réexporté pour l'API)
 
 
 class NLLBTranslator:
@@ -49,6 +40,10 @@ class NLLBTranslator:
             low_cpu_mem_usage=True,
         )
 
+        # 2b. Jetons de langue ajoutés à l'entraînement (ex. gux_Latn) : ils sont dans le tokenizer de l'adaptateur
+        if len(self.tokenizer) > base_model.get_input_embeddings().num_embeddings:
+            base_model.resize_token_embeddings(len(self.tokenizer))
+
         # 3. Application de l'adaptateur LoRA
         logging.info(f"Application des poids LoRA depuis {self.ADAPTER_MODEL_ID}...")
         peft_model = PeftModel.from_pretrained(base_model, self.ADAPTER_MODEL_ID)
@@ -56,6 +51,10 @@ class NLLBTranslator:
         # 4. Fusion des poids pour maximiser la vitesse d'inférence en production
         self.model = peft_model.merge_and_unload().to(self.device)
         self.model.eval()
+
+        # Identifie l'adaptateur : entre dans la clé de cache, pour ne pas servir d'anciennes traductions
+        adapter_file = Path(self.ADAPTER_MODEL_ID) / "adapter_model.safetensors"
+        self.version = str(int(adapter_file.stat().st_mtime)) if adapter_file.exists() else "base"
 
         logging.info(f"✅ NLLB-200 Fine-tuné fusionné et prêt pour la production sur {self.device}")
 
@@ -103,32 +102,3 @@ class NLLBTranslator:
 
             return self.tokenizer.decode(output_tokens[0], skip_special_tokens=True)
 
-    def translate_batch(self, texts: list[str], src_lang: str, tgt_lang: str) -> list[str]:
-        """Traduction par lot — optimise le débit pour plusieurs phrases."""
-        with self._lock:
-            src_code = BURKINA_LANG_CODES.get(src_lang, src_lang)
-            tgt_code = BURKINA_LANG_CODES.get(tgt_lang, tgt_lang)
-
-            self.tokenizer.src_lang = src_code
-            inputs = self.tokenizer(
-                texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512,
-            ).to(self.device)
-
-            tgt_lang_id = self._resolve_lang_id(tgt_code)
-
-            with torch.no_grad():
-                output_tokens = self.model.generate(
-                    **inputs,
-                    forced_bos_token_id=tgt_lang_id,
-                    max_length=512,
-                    num_beams=4,
-                )
-
-            return [
-                self.tokenizer.decode(tok, skip_special_tokens=True)
-                for tok in output_tokens
-            ]

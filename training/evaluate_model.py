@@ -176,6 +176,9 @@ def translate_batch(
     src_nllb = LANG_CODES.get(src_lang, src_lang)
     tgt_nllb = LANG_CODES.get(tgt_lang, tgt_lang)
     tgt_id   = tokenizer.convert_tokens_to_ids(tgt_nllb)
+    unk = tokenizer.unk_token_id
+    if unk in (tgt_id, tokenizer.convert_tokens_to_ids(src_nllb)):
+        raise ValueError(f"jeton de langue absent du tokenizer ({src_nllb} ou {tgt_nllb})")
 
     tokenizer.src_lang = src_nllb
     translations = []

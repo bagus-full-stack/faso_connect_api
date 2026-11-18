@@ -64,6 +64,10 @@ def main():
         if sl not in LANG_CODES or tl not in LANG_CODES:
             logger.warning(f"Direction ignorée (langue inconnue) : {sl}->{tl}")
             continue
+        unk = tok.unk_token_id
+        if unk in (tok.convert_tokens_to_ids(LANG_CODES[sl]), tok.convert_tokens_to_ids(LANG_CODES[tl])):
+            logger.warning(f"Direction ignorée (jeton absent du modèle de base, notes vides) : {sl}->{tl}")
+            continue
         logger.info(f"Score {sl}->{tl} : {len(g):,} paires")
         df.loc[g.index, "nll"] = score_group(tok, model, g["src"].tolist(), g["tgt"].tolist(), sl, tl)
 

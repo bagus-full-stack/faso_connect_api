@@ -1,10 +1,11 @@
 # history/router.py
+import os
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from api.deps import get_user_id, limiter, verify_api_key
-from sqlmodel import Session, select, func, col
+from sqlmodel import Session, select, func, col, delete
 
 from history.database import get_session
 from history.models import (
@@ -18,6 +19,8 @@ from translation.nllb_engine import BURKINA_LANG_CODES
 from tts.mms_engine import MMS_TTS_MODELS
 
 router = APIRouter(prefix="/history", tags=["Historique"], dependencies=[Depends(verify_api_key)])
+
+MAX_ENTRIES_PER_USER = int(os.getenv("HISTORY_MAX_ENTRIES", "1000"))
 
 # ── Helpers de validation ─────────────────────────────────────────────
 
@@ -85,6 +88,10 @@ def create_history_entry(
     - Retourne 201 avec l'entrée créée
     """
     validate_entry(entry)
+
+    n = session.exec(select(func.count()).select_from(HistoryEntry).where(HistoryEntry.user_id == user_id)).one()
+    if n >= MAX_ENTRIES_PER_USER:
+        raise HTTPException(status_code=409, detail=f"Historique plein ({MAX_ENTRIES_PER_USER}). Supprime des entrées.")
 
     db_entry = HistoryEntry(**entry.model_dump(), user_id=user_id)
     session.add(db_entry)
@@ -197,10 +204,5 @@ def clear_history(
     - ne touche que l'historique de la session courante (X-Session-Id)
     - 204 dans tous les cas (idempotent)
     """
-    entries = session.exec(
-        select(HistoryEntry).where(HistoryEntry.user_id == user_id)
-    ).all()
-
-    for entry in entries:
-        session.delete(entry)
+    session.exec(delete(HistoryEntry).where(HistoryEntry.user_id == user_id))
     session.commit()

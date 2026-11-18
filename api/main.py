@@ -297,6 +297,29 @@ async def run_with_timeout(fn, *args, timeout: int = None):
             detail=f"Inférence trop longue (>{limit}s). Réessaie avec un texte plus court.",
         )
 
+async def _infer(fn, *args, error_event: str, error_detail: str):
+    """Inférence bornée ; ValueError -> 400, autre erreur -> 500 (journalisée)."""
+    try:
+        return await run_with_timeout(fn, *args)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"{error_detail} : {e}", extra={"event": error_event})
+        raise HTTPException(status_code=500, detail=error_detail)
+
+def _translate(request: Request, req):
+    return _infer(request.app.state.translator.translate, req.text, req.src_lang, req.tgt_lang,
+                  error_event="translation_error", error_detail="Erreur interne lors de la traduction")
+
+def _synthesize(request: Request, text: str, lang: str, speed: float):
+    return _infer(request.app.state.tts.synthesize, text, lang, speed,
+                  error_event="tts_error", error_detail="Erreur interne lors de la synthèse vocale")
+
+def _model_version(request: Request) -> str:
+    return getattr(request.app.state.translator, "version", "")
+
 # ── Endpoints système ─────────────────────────────────────────────────
 
 @app.get(
@@ -356,23 +379,12 @@ async def translate(request: Request, req: TranslationRequest):
     - **Cache** : résultat mis en cache Redis 1h
     - **Async** : ne bloque pas les autres requêtes pendant l'inférence
     """
-    cache_key = make_cache_key("trans", req.text, req.src_lang, req.tgt_lang)
+    cache_key = make_cache_key("trans", _model_version(request), req.text, req.src_lang, req.tgt_lang)
     cached = cache_get(cache_key)
     if cached:
         return TranslationResponse(**{**cached, "cached": True})
 
-    try:
-        result = await run_with_timeout(
-            request.app.state.translator.translate,
-            req.text, req.src_lang, req.tgt_lang,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur traduction : {e}", extra={"event": "translation_error"})
-        raise HTTPException(status_code=500, detail="Erreur interne lors de la traduction")
+    result = await _translate(request, req)
 
     data = {
         "translated_text": result,
@@ -406,18 +418,7 @@ async def text_to_speech(request: Request, req: TTSRequest):
     if cached:
         return TTSResponse(**cached)
 
-    try:
-        result = await run_with_timeout(
-            request.app.state.tts.synthesize,
-            req.text, req.lang, req.speed,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur TTS : {e}", extra={"event": "tts_error"})
-        raise HTTPException(status_code=500, detail="Erreur interne lors de la synthèse vocale")
+    result = await _synthesize(request, req.text, req.lang, req.speed)
 
     data = {
         "audio_b64":        result.audio_b64,
@@ -446,38 +447,13 @@ async def translate_and_speak(request: Request, req: TranslateAndSpeakRequest):
     - Retourne le texte traduit ET l'audio base64
     - Résultat mis en cache Redis 1h
     """
-    cache_key = make_cache_key("pipeline", req.text, req.src_lang, req.tgt_lang, req.speed)
+    cache_key = make_cache_key("pipeline", _model_version(request), req.text, req.src_lang, req.tgt_lang, req.speed)
     cached = cache_get(cache_key)
     if cached:
         return {**cached, "cached": True}
 
-    # Étape 1 — Traduction
-    try:
-        translated = await run_with_timeout(
-            request.app.state.translator.translate,
-            req.text, req.src_lang, req.tgt_lang,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur traduction : {e}", extra={"event": "translation_error"})
-        raise HTTPException(status_code=500, detail="Erreur interne lors de la traduction")
-
-    # Étape 2 — Synthèse vocale sur le texte traduit
-    try:
-        audio = await run_with_timeout(
-            request.app.state.tts.synthesize,
-            translated, req.tgt_lang, req.speed,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Erreur TTS : {e}", extra={"event": "tts_error"})
-        raise HTTPException(status_code=500, detail="Erreur interne lors de la synthèse vocale")
+    translated = await _translate(request, req)                                  # 1. traduction
+    audio = await _synthesize(request, translated, req.tgt_lang, req.speed)      # 2. voix sur le texte traduit
 
     data = {
         "original_text":    req.text,

@@ -36,6 +36,8 @@ logger = logging.getLogger(__name__)
 
 CORPUS_FILE       = "data/processed/corpus_burkina.csv"
 RADIO_CORPUS_FILE = "data/processed/corpus_burkina_radio.csv"
+EXTRA_CORPUS_FILE = "data/processed/corpus_burkina_extra.csv"
+BIBLE_CORPUS_FILE = "data/processed/corpus_burkina_bible.csv"
 OUTPUT_FILE       = Path("data/processed/corpus_burkina_clean.csv")
 
 MIN_CHARS            = 5
@@ -57,6 +59,13 @@ def load_all_corpora() -> pd.DataFrame:
         logger.error(f"❌ Corpus introuvable : {CORPUS_FILE}")
         logger.error("   Lance d'abord : python collect/download_all_datasets.py")
         sys.exit(1)
+
+    # écrits par collect/download_extra_datasets.py et collect/align_bibles.py
+    for extra_file in (EXTRA_CORPUS_FILE, BIBLE_CORPUS_FILE):
+        if Path(extra_file).exists():
+            df_extra = pd.read_csv(extra_file, encoding="utf-8")
+            frames.append(df_extra)
+            logger.info(f"✅ {extra_file} : {len(df_extra):,} paires")
 
     if INCLUDE_RADIO and Path(RADIO_CORPUS_FILE).exists():
         df_radio = pd.read_csv(RADIO_CORPUS_FILE, encoding="utf-8")
@@ -195,8 +204,7 @@ def print_report(df_train: pd.DataFrame, df_valid: pd.DataFrame):
         logger.warning(
             "\n⚠️  Corpus d'entraînement insuffisant (<1000 paires).\n"
             "   Le fine-tuning ne convergera pas correctement.\n"
-            "   Résous d'abord le problème Google SMOL :\n"
-            "     python debug_smol.py"
+            "   Vérifie les téléchargements : python collect/download_all_datasets.py"
         )
     logger.info("="*55)
 

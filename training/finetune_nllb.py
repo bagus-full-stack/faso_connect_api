@@ -43,23 +43,11 @@ LOG_DIR     = "logs/tensorboard"
 CORPUS_FILE = os.getenv("CORPUS_FILE", "data/processed/corpus_burkina_clean.csv")
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
-LANG_CODES = {
-    "moore":        "mos_Latn",
-    "dioula":       "dyu_Latn",
-    "bambara":      "bam_Latn",
-    "fulfulde":     "fuv_Latn",
-    "gourmantsema": "gux_Latn",
-    "dagaare":      "dga_Latn",
-    "francais":     "fra_Latn",
-    "anglais":      "eng_Latn",
-    "mos": "mos_Latn",
-    "dyu": "dyu_Latn",
-    "bam": "bam_Latn",
-    "fuv": "fuv_Latn",
-    "fra": "fra_Latn",
-    "eng": "eng_Latn",
-    "ff":  "fuv_Latn",
-}
+# Codes de langue à ajouter au tokenizer (absents de NLLB-200) ; "" pour désactiver
+NEW_LANG_TOKENS = [t for t in os.getenv("NEW_LANG_TOKENS", "gux_Latn").split(",") if t]
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lancé par `python training/finetune_nllb.py`
+from translation.lang_codes import LANG_CODES  # noqa: E402
 
 TRAIN_EPOCHS            = 5
 BATCH_SIZE              = 4     # 8
@@ -103,6 +91,18 @@ def load_model():
         use_safetensors=True,
     ).to(DEVICE)
 
+    # 1b. Langues absentes de NLLB-200 : un jeton par code (ex. gux_Latn), dont seule la ligne
+    # d'embedding est entraînée (trainable_token_indices) ; l'adaptateur sauvegardé la contient.
+    missing = [t for t in NEW_LANG_TOKENS
+               if tokenizer.convert_tokens_to_ids(t) in (tokenizer.unk_token_id, None)]
+    new_ids = []
+    if missing:
+        tokenizer.add_tokens(missing, special_tokens=True)
+        if len(tokenizer) > model.get_input_embeddings().num_embeddings:
+            model.resize_token_embeddings(len(tokenizer))
+        new_ids = [tokenizer.convert_tokens_to_ids(t) for t in missing]
+        logger.info(f"Jetons de langue ajoutés : {dict(zip(missing, new_ids))}")
+
     # 2. Configuration LoRA
     lora_config = LoraConfig(
         r=16,
@@ -110,7 +110,8 @@ def load_model():
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "fc1", "fc2"],  # Cible l'attention
         lora_dropout=0.05,
         bias="none",
-        task_type=TaskType.SEQ_2_SEQ_LM
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        trainable_token_indices={"embed_tokens": new_ids} if new_ids else None,
     )
 
     # 3. Application de LoRA au modèle
@@ -212,6 +213,20 @@ def load_corpus():
     return df_train, df_valid
 
 # ── Tokenisation ──────────────────────────────────────────────────────
+
+def drop_unsupported_langs(df, tokenizer, name):
+    """Retire les lignes dont une langue n'a pas de jeton dans le tokenizer (ex. gux_Latn, dga_Latn :
+    absents de NLLB-200). Sinon le code de langue devient <unk> et pollue l'entraînement."""
+    unk = tokenizer.unk_token_id
+    bad = {l for l in set(df["src_lang"]) | set(df["tgt_lang"])
+           if tokenizer.convert_tokens_to_ids(LANG_CODES.get(l, "")) in (unk, None)}
+    if bad:
+        n0 = len(df)
+        df = df[~df["src_lang"].isin(bad) & ~df["tgt_lang"].isin(bad)]
+        logger.warning(f"[{name}] langues sans jeton NLLB, lignes retirées : {sorted(bad)} ({n0 - len(df):,} lignes). "
+                       "Ajoute le jeton au tokenizer pour les entraîner.")
+    return df
+
 
 def make_tokenize_fn(tokenizer):
     def tokenize(examples):
@@ -462,6 +477,8 @@ if __name__ == "__main__":
 
     tokenizer, model   = load_model()
     df_train, df_valid = load_corpus()
+    df_train = drop_unsupported_langs(df_train, tokenizer, "train")
+    df_valid = drop_unsupported_langs(df_valid, tokenizer, "valid")
     tokenized          = build_datasets(tokenizer, df_train, df_valid)
     trainer            = train(tokenizer, model, tokenized)
 
