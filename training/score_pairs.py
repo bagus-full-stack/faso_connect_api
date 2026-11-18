@@ -1,15 +1,15 @@
 # training/score_pairs.py — filtre les paires par perte de décodage forcé (NLL moyenne par token)
 """
-Score chaque paire (src -> tgt) avec le modèle de base NLLB, puis retire par direction les
-DROP_FRAC paires les moins plausibles (mal alignées, cible tronquée, bruit).
+Score chaque paire (src -> tgt) avec le modèle de base NLLB (colonne nll). Le filtre lui-même
+(retrait par direction des DROP_FRAC paires les moins plausibles) est appliqué par finetune_nllb.py
+au train seulement, APRÈS le split test/validation : le test reste non filtré.
 
 Usage (Kaggle ou local) :
     python -m training.score_pairs
     DROP_FRAC=0.07 NLLB_BASE_MODEL=facebook/nllb-200-distilled-1.3B python -m training.score_pairs
 
 Sortie :
-    data/processed/corpus_burkina_scored.csv    (toutes les lignes + colonne nll)
-    data/processed/corpus_burkina_filtered.csv  (après filtre) -> CORPUS_FILE pour finetune_nllb.py
+    data/processed/corpus_burkina_scored.csv  (toutes les lignes + colonne nll) -> CORPUS_FILE
 """
 import os
 import logging
@@ -18,14 +18,12 @@ import numpy as np
 import pandas as pd
 import torch
 
-from training.data_prep import quantile_filter
 from training.finetune_nllb import BASE_MODEL, LANG_CODES, DEVICE, hf_login
 
 logger = logging.getLogger(__name__)
 
 IN_FILE = os.getenv("CORPUS_FILE", "data/processed/corpus_burkina_clean.csv")
 SCORED = "data/processed/corpus_burkina_scored.csv"
-FILTERED = "data/processed/corpus_burkina_filtered.csv"
 DROP_FRAC = float(os.getenv("DROP_FRAC", "0.07"))
 BATCH = int(os.getenv("SCORE_BATCH", "32"))
 MAXLEN = 128
@@ -70,11 +68,10 @@ def main():
         df.loc[g.index, "nll"] = score_group(tok, model, g["src"].tolist(), g["tgt"].tolist(), sl, tl)
 
     df.to_csv(SCORED, index=False, encoding="utf-8")
-    scored = df.dropna(subset=["nll"])
-    kept = pd.concat([quantile_filter(scored, drop_frac=DROP_FRAC), df[df["nll"].isna()]])
-    kept.drop(columns="nll").to_csv(FILTERED, index=False, encoding="utf-8")
-    logger.info(f"{len(df):,} -> {len(kept):,} lignes (retiré {len(df) - len(kept):,}) : {FILTERED}")
-    logger.info("Relis un échantillon de %s (tri par nll décroissant) avant de fixer DROP_FRAC.", SCORED)
+    logger.info(f"{len(df):,} lignes scorées : {SCORED}")
+    logger.info("Lance l'entraînement avec CORPUS_FILE=%s : le split test/validation se fait AVANT le filtre, "
+                "qui ne touche que le train (DROP_FRAC=%s).", SCORED, DROP_FRAC)
+    logger.info("Relis un échantillon trié par nll décroissant avant de fixer DROP_FRAC.")
 
 
 if __name__ == "__main__":

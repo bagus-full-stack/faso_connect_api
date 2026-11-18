@@ -127,16 +127,41 @@ def load_flores(src_lang: str, tgt_lang: str) -> list[dict]:
 HOLDOUT_FILE = "data/processed/test_bambara.csv"  # écrit par finetune_nllb.py (bambara->francais)
 
 
-def load_holdout(src_lang: str, tgt_lang: str) -> list[dict]:
-    """Test bambara tenu à l'écart du train, dans les deux sens (le fichier est bambara->francais)."""
-    if {src_lang, tgt_lang} != {"bambara", "francais"} or not Path(HOLDOUT_FILE).exists():
+REAL_FILE = "data/processed/test_reel.csv"        # écrit par finetune_nllb.py, à faire relire (colonne verifie)
+
+
+def _load_pairs_file(path: str, src_lang: str, tgt_lang: str) -> list[dict]:
+    """Lignes d'un fichier de test pour la paire demandée, dans l'un ou l'autre sens."""
+    if not Path(path).exists():
         return []
     import pandas as pd
-    df = pd.read_csv(HOLDOUT_FILE, encoding="utf-8")
-    a, b = ("src", "tgt") if src_lang == "bambara" else ("tgt", "src")
-    pairs = [{"src": s, "tgt": t} for s, t in zip(df[a].astype(str), df[b].astype(str))]
-    logger.info(f"✅ Test bambara tenu à l'écart {src_lang}→{tgt_lang} : {len(pairs)} phrases")
+    df = pd.read_csv(path, encoding="utf-8")
+    if "verifie" in df and df["verifie"].notna().any():  # relecture commencée : ne garder que les lignes validées
+        df = df[df["verifie"].notna()]
+    fwd = df[(df["src_lang"] == src_lang) & (df["tgt_lang"] == tgt_lang)]
+    rev = df[(df["src_lang"] == tgt_lang) & (df["tgt_lang"] == src_lang)]
+    return ([{"src": s, "tgt": t} for s, t in zip(fwd["src"].astype(str), fwd["tgt"].astype(str))]
+            + [{"src": s, "tgt": t} for s, t in zip(rev["tgt"].astype(str), rev["src"].astype(str))])
+
+
+def load_holdout(src_lang: str, tgt_lang: str) -> list[dict]:
+    """Test bambara tenu à l'écart du train, dans les deux sens (le fichier est bambara->francais)."""
+    pairs = _load_pairs_file(HOLDOUT_FILE, src_lang, tgt_lang)
+    if pairs:
+        logger.info(f"✅ Test bambara tenu à l'écart {src_lang}→{tgt_lang} : {len(pairs)} phrases")
     return pairs
+
+
+def real_test_jobs() -> list[tuple]:
+    """Directions présentes dans test_reel.csv, dans les deux sens."""
+    if not Path(REAL_FILE).exists():
+        return []
+    import pandas as pd
+    df = pd.read_csv(REAL_FILE, encoding="utf-8")
+    jobs = []
+    for s, t in df[["src_lang", "tgt_lang"]].drop_duplicates().itertuples(index=False):
+        jobs += [(s, t), (t, s)]
+    return jobs
 
 # ── Traduction par lot ────────────────────────────────────────────────
 
@@ -230,12 +255,16 @@ def evaluate_model(
     logger.info(f"Évaluation : {model_name}")
     logger.info(f"{'='*55}")
 
-    for src_lang, tgt_lang in lang_pairs:
-        logger.info(f"\n  {src_lang} → {tgt_lang}")
+    jobs = [(s, t, "") for s, t in lang_pairs] + [(s, t, "_reel") for s, t in real_test_jobs()]
+    for src_lang, tgt_lang, tag in jobs:
+        logger.info(f"\n  {src_lang} → {tgt_lang}{tag}")
 
         try:
             # Chargement FLORES-200
-            pairs = load_holdout(src_lang, tgt_lang) or load_flores(src_lang, tgt_lang)
+            if tag:
+                pairs = _load_pairs_file(REAL_FILE, src_lang, tgt_lang)
+            else:
+                pairs = load_holdout(src_lang, tgt_lang) or load_flores(src_lang, tgt_lang)
             if not pairs:
                 logger.warning(f"  ⚠️  Pas de données FLORES pour {src_lang}→{tgt_lang}")
                 continue
@@ -256,7 +285,7 @@ def evaluate_model(
             metrics["duration_s"]   = duration
             metrics["nb_sentences"] = len(pairs)
 
-            all_results[f"{src_lang}_{tgt_lang}"] = metrics
+            all_results[f"{src_lang}_{tgt_lang}{tag}"] = metrics
 
             logger.info(
                 f"  BLEU={metrics['bleu']:.1f} | "

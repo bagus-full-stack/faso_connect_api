@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 BASE_MODEL  = os.getenv("NLLB_BASE_MODEL", "facebook/nllb-200-distilled-600M")
 OUTPUT_DIR  = "models/nllb-burkina-v1"
 LOG_DIR     = "logs/tensorboard"
-# corpus filtré par score_pairs.py : CORPUS_FILE=data/processed/corpus_burkina_filtered.csv
+# avec filtre qualité : CORPUS_FILE=data/processed/corpus_burkina_scored.csv (sortie de score_pairs.py)
 CORPUS_FILE = os.getenv("CORPUS_FILE", "data/processed/corpus_burkina_clean.csv")
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -169,10 +169,22 @@ def load_corpus():
 
     # Validation = FLORES + 500 phrases bambara (absent de FLORES) ; test bambara écarté du train
     try:
-        from training.data_prep import split_corpus, temperature_sample, both_directions
+        from training.data_prep import (split_corpus, split_real_test, temperature_sample,
+                                        both_directions, quantile_filter)
     except ImportError:  # lancé par `python training/finetune_nllb.py`
-        from data_prep import split_corpus, temperature_sample, both_directions
+        from data_prep import (split_corpus, split_real_test, temperature_sample,
+                               both_directions, quantile_filter)
+    # split sur le corpus NON filtré ; le filtre de qualité (colonne nll de score_pairs.py) ne vise que le train
     df_train, df_valid, df_test = split_corpus(df, holdout_lang="bambara")
+    # test « usage réel » par langue (dioula, peul, mooré), retiré du train avant le filtre
+    df_train, df_real = split_real_test(df_train, n=int(os.getenv("REAL_TEST_N", "150")))
+    df_real.drop(columns=["nll"], errors="ignore").assign(verifie="").to_csv(
+        "data/processed/test_reel.csv", index=False, encoding="utf-8")
+    if "nll" in df_train.columns:
+        n0 = len(df_train)
+        df_train = quantile_filter(df_train, drop_frac=float(os.getenv("DROP_FRAC", "0.07")))
+        logger.info(f"Filtre NLL (train seulement) : {n0:,} -> {len(df_train):,}")
+        df_train, df_valid, df_test = (d.drop(columns="nll") for d in (df_train, df_valid, df_test))
     # validation dans les deux sens, 250 phrases max par direction
     df_valid = both_directions(df_valid, cap=int(os.getenv("VALID_PER_DIRECTION", "250")))
     logger.info(f"Validation : {len(df_valid):,} lignes\n"

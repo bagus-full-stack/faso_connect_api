@@ -24,59 +24,86 @@ def norm(text: str) -> str:
 def split_corpus(
     df: pd.DataFrame,
     holdout_lang: str = "bambara",
+    holdout_source: str = "hf_djelia",
     n_valid: int = 500,
     n_test: int = 1000,
     min_words: int = 3,
+    block: int = 25,
     seed: int = 42,
 ):
     """
     Retourne (df_train, df_valid, df_test).
 
     - FLORES (source == "flores_dev") reste la validation de base.
-    - On retire du train `n_valid + n_test` paires holdout_lang<->francais, orientées
-      holdout_lang -> francais (le `forced_bos_token_id` de l'éval est fra_Latn).
-    - n_valid paires s'ajoutent à la validation (early stopping) ; n_test paires forment
-      un test jamais vu ni pour l'entraînement ni pour le choix du modèle.
+    - Pour `holdout_lang` (absente de FLORES), on retire du train `n_valid` + `n_test` paires
+      holdout_lang -> francais, prises par BLOCS de `block` lignes consécutives de `holdout_source`
+      (source distincte de la source dominante du train). Les lignes voisines d'un même texte restent
+      ainsi du même côté de la coupure. Les blocs entiers sont retirés du train.
+      shortcut: on suppose que l'ordre des lignes du CSV suit l'ordre des documents ; à remplacer par
+      un vrai identifiant de document si le corpus en reçoit un.
+    - Les blocs du test et ceux de la validation sont disjoints.
     - Toute ligne du train dont le texte holdout_lang est identique (après normalisation)
       à une phrase tenue à l'écart est retirée : pas de fuite.
+    - Le split se fait sur le corpus NON filtré : appliquer le filtre de qualité au train seulement.
     """
     flores = df["source"] == "flores_dev"
     rest = df[~flores]
 
-    side_src = rest["src_lang"] == holdout_lang
-    side_tgt = rest["tgt_lang"] == holdout_lang
-    pair_fr = ((side_src & (rest["tgt_lang"] == "francais")) |
-               (side_tgt & (rest["src_lang"] == "francais")))
-    cand = rest[pair_fr].copy()
+    involves = (rest["src_lang"] == holdout_lang) | (rest["tgt_lang"] == holdout_lang)
+    pair_fr = involves & ((rest["src_lang"] == "francais") | (rest["tgt_lang"] == "francais"))
+    pool = rest[pair_fr]
+    if holdout_source not in set(pool["source"]):
+        logger.warning(f"Source {holdout_source!r} absente : holdout pris dans toutes les sources")
+        holdout_source = None
+    elif (pool["source"] == holdout_source).sum() < 2 * (n_valid + n_test):
+        logger.warning(f"Source {holdout_source!r} trop petite : holdout pris dans toutes les sources")
+        holdout_source = None
+    pool = pool if holdout_source is None else pool[pool["source"] == holdout_source]
 
-    # orientation holdout_lang -> francais
-    swap = cand["tgt_lang"] == holdout_lang
+    # blocs de lignes consécutives (ordre d'origine du CSV)
+    pool = pool.sort_index()
+    blk = pd.Series(np.arange(len(pool)) // block, index=pool.index)
+
+    cand = pool.copy()
+    swap = cand["tgt_lang"] == holdout_lang          # orientation holdout_lang -> francais
     cand.loc[swap, ["src", "tgt"]] = cand.loc[swap, ["tgt", "src"]].to_numpy()
     cand["src_lang"], cand["tgt_lang"] = holdout_lang, "francais"
-
     cand["_key"] = cand["src"].map(norm)
+    cand["_blk"] = blk
     cand = cand[cand["src"].str.split().str.len() >= min_words]  # pas de mots isolés
     cand = cand.drop_duplicates("_key")
 
-    n_total = min(n_valid + n_test, len(cand) // 2)  # garde au moins la moitié pour le train
-    if n_total < n_valid + n_test:
-        logger.warning(f"Seulement {len(cand)} candidats {holdout_lang} : holdout réduit à {n_total}")
-    hold = cand.sample(n=n_total, random_state=seed)
-    n_v = round(n_total * n_valid / (n_valid + n_test)) if (n_valid + n_test) else 0
-    hold_valid, hold_test = hold.iloc[:n_v], hold.iloc[n_v:]
+    rng = np.random.RandomState(seed)
+    blocks = rng.permutation(cand["_blk"].unique())
+    sizes = cand.groupby("_blk").size()
+    test_blk, valid_blk, n_t, n_v = [], [], 0, 0
+    for b in blocks:
+        if n_t < n_test:
+            test_blk.append(b); n_t += sizes[b]
+        elif n_v < n_valid:
+            valid_blk.append(b); n_v += sizes[b]
+        else:
+            break
+    if n_t < n_test or n_v < n_valid:
+        logger.warning(f"Holdout {holdout_lang} incomplet : test {n_t}/{n_test}, valid {n_v}/{n_valid}")
+    hold_test = cand[cand["_blk"].isin(test_blk)].sample(frac=1, random_state=seed).head(n_test)
+    hold_valid = cand[cand["_blk"].isin(valid_blk)].sample(frac=1, random_state=seed).head(n_valid)
 
-    keys = set(hold["_key"])
-    involves = (rest["src_lang"] == holdout_lang) | (rest["tgt_lang"] == holdout_lang)
+    # retire du train les blocs entiers + toute phrase identique ailleurs
+    held_blk = test_blk + valid_blk
+    block_rows = blk.index[blk.isin(held_blk)]
+    keys = set(cand.loc[cand["_blk"].isin(held_blk), "_key"])
     holdout_text = np.where(rest["src_lang"] == holdout_lang, rest["src"], rest["tgt"])
     leaked = involves.to_numpy() & pd.Series(holdout_text, index=rest.index).map(norm).isin(keys).to_numpy()
-    df_train = rest[~leaked]
+    df_train = rest[~leaked & ~rest.index.isin(block_rows)]
 
-    cols = [c for c in df.columns]
+    cols = list(df.columns)
     df_valid = pd.concat([df[flores], hold_valid[cols]], ignore_index=True)
     df_test = hold_test[cols].reset_index(drop=True)
     logger.info(
         f"Split : train {len(df_train):,} | valid {len(df_valid):,} "
-        f"(FLORES {int(flores.sum()):,} + {holdout_lang} {len(hold_valid):,}) | test {len(df_test):,}"
+        f"(FLORES {int(flores.sum()):,} + {holdout_lang} {len(hold_valid):,}) | test {len(df_test):,} "
+        f"[source={holdout_source or 'toutes'}, blocs de {block}]"
     )
     return df_train, df_valid, df_test
 
@@ -139,5 +166,65 @@ def quantile_filter(
     Les sources protégées (validation FLORES) ne sont jamais retirées.
     """
     thr = df.groupby(["src_lang", "tgt_lang"])[score_col].transform(lambda s: s.quantile(1 - drop_frac))
-    keep = (df[score_col] <= thr) | df["source"].isin(protect_sources)
+    # lignes sans score (langue inconnue du scoring) : conservées
+    keep = (df[score_col] <= thr) | df[score_col].isna() | df["source"].isin(protect_sources)
     return df[keep]
+
+
+# ── 4. Test « usage réel » par langue ─────────────────────────────────
+
+REAL_TEST_SOURCES = {"dioula": "hf_uvci", "fulfulde": "hf_arprim", "moore": "smol_sent"}
+
+
+def split_real_test(
+    df_train: pd.DataFrame,
+    specs: dict = None,
+    n: int = 150,
+    min_words: int = 3,
+    block: int = 25,
+    seed: int = 42,
+):
+    """
+    Retire du train un petit test « usage réel » par langue, pris dans une source de phrases courantes
+    (specs = {langue: source}). Même méthode que split_corpus : blocs de `block` lignes consécutives de
+    la source, blocs entiers retirés du train, et toute phrase identique ailleurs retirée aussi.
+    La paire garde son orientation d'origine (francais->dioula, anglais->moore...).
+    Retourne (df_train, df_real). À faire relire par un locuteur avant de s'y fier.
+    """
+    specs = REAL_TEST_SOURCES if specs is None else specs
+    rng = np.random.RandomState(seed)
+    drop_idx, keys, parts = set(), {}, []
+    nonpivot = pd.Series(np.where(df_train["tgt_lang"].isin(PIVOTS), df_train["src_lang"], df_train["tgt_lang"]),
+                         index=df_train.index)
+    langtext = pd.Series(np.where(df_train["tgt_lang"].isin(PIVOTS), df_train["src"], df_train["tgt"]),
+                         index=df_train.index)
+
+    for lang, source in specs.items():
+        pool = df_train[(df_train["source"] == source) & (nonpivot == lang)].sort_index()
+        if pool.empty:
+            logger.warning(f"Test réel {lang}: aucune ligne dans {source!r}, ignoré")
+            continue
+        blk = pd.Series(np.arange(len(pool)) // block, index=pool.index)
+        cand = pool.assign(_blk=blk, _key=langtext.loc[pool.index].map(norm))
+        cand = cand[langtext.loc[cand.index].str.split().str.len() >= min_words].drop_duplicates("_key")
+        sizes = cand.groupby("_blk").size()
+        chosen, got = [], 0
+        for b in rng.permutation(sizes.index.to_numpy()):
+            if got >= n:
+                break
+            chosen.append(b); got += sizes[b]
+        if got < n:
+            logger.warning(f"Test réel {lang}: {got}/{n} phrases seulement dans {source!r}")
+        sel = cand[cand["_blk"].isin(chosen)].sample(frac=1, random_state=seed).head(n)
+        parts.append(sel.drop(columns=["_blk", "_key"]))
+        drop_idx |= set(blk.index[blk.isin(chosen)])
+        keys[lang] = set(cand.loc[cand["_blk"].isin(chosen), "_key"])
+
+    leaked = pd.Series(False, index=df_train.index)
+    for lang, ks in keys.items():
+        leaked |= (nonpivot == lang) & langtext.map(norm).isin(ks)
+    out = df_train[~leaked & ~df_train.index.isin(drop_idx)]
+    real = pd.concat(parts, ignore_index=True) if parts else df_train.iloc[0:0]
+    logger.info(f"Test réel : {len(real)} phrases ({real.groupby('src_lang').size().to_dict() if len(real) else {}}) ; "
+                f"train {len(df_train):,} -> {len(out):,}")
+    return out, real
