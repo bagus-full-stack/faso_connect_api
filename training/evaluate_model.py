@@ -85,6 +85,9 @@ def load_model(model_path: str):
             low_cpu_mem_usage=True,
             use_safetensors=True,
         ).to(DEVICE)
+        # Jetons de langue ajoutés à l'entraînement (gux_Latn) : comme dans nllb_engine
+        if len(tokenizer) > base_model.get_input_embeddings().num_embeddings:
+            base_model.resize_token_embeddings(len(tokenizer))
 
         # On greffe les poids LoRA dessus
         model = PeftModel.from_pretrained(base_model, model_path)
