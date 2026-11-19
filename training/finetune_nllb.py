@@ -365,7 +365,7 @@ def make_lang_trainer_class():
             if labels is not None and not prediction_loss_only:
                 # labels[:, 0] = code de langue cible (le tokenizer le place en tête) ; le décodeur
                 # démarre sur </s> puis ce code, ce qui remplace un forced_bos_token_id unique.
-                start = torch.full_like(labels[:, :1], model.config.decoder_start_token_id)
+                start = torch.full_like(labels[:, :1], self.model.config.decoder_start_token_id)  # self.model : `model` est un DataParallel sur 2 GPU
                 gen_kwargs["decoder_input_ids"] = torch.cat([start, labels[:, :1]], dim=1)
             return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys, **gen_kwargs)
 
