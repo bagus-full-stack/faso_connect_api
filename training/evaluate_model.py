@@ -81,7 +81,7 @@ def load_model(model_path: str):
         # On charge le modèle de base NLLB
         base_model = AutoModelForSeq2SeqLM.from_pretrained(
             BASE_MODEL,
-            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+            dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
             use_safetensors=True,
         ).to(DEVICE)

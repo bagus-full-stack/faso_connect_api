@@ -86,7 +86,7 @@ def load_model():
     # 1. Charger en float16 pour économiser la RAM/VRAM
     model = AutoModelForSeq2SeqLM.from_pretrained(
         BASE_MODEL,
-        torch_dtype=torch.float16,
+        dtype=torch.float16,
         low_cpu_mem_usage=True,
         use_safetensors=True,
     ).to(DEVICE)

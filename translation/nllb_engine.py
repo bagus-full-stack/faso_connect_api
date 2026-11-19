@@ -36,7 +36,7 @@ class NLLBTranslator:
         # 2. Chargement du modèle de base
         base_model = AutoModelForSeq2SeqLM.from_pretrained(
             self.BASE_MODEL_ID,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            dtype=torch.float16 if self.device == "cuda" else torch.float32,
             low_cpu_mem_usage=True,
         )
 

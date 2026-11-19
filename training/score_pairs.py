@@ -57,7 +57,7 @@ def main():
 
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        BASE_MODEL, torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE).eval()
+        BASE_MODEL, dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE).eval()
 
     df["nll"] = np.nan
     for (sl, tl), g in df.groupby(["src_lang", "tgt_lang"]):
